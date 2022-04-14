@@ -45,7 +45,7 @@ class L2Norm(nn.Module):
 
 
 def get_pca_encoding(model, vlad_encoding):
-    pca_encoding = model.WPCA(vlad_encoding.unsqueeze(-1).unsqueeze(-1))
+    pca_encoding = model.module.WPCA(vlad_encoding.unsqueeze(-1).unsqueeze(-1))
     return pca_encoding
 
 

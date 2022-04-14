@@ -19,6 +19,7 @@ from IPython import embed
 import wandb
 import random
 import tarfile
+import torch.nn as nn
 from evaluate_depth import evaluate_with_train
 from networks.discriminator import FCDiscriminator
 from torch.autograd import Variable
@@ -28,6 +29,7 @@ from Load_patchNet import load_patchNet
 from transdssl.transdssl_encoder import TRANSDSSLEncoder
 from transdssl.transdssl_decoder import TRANSDSSLDecoder
 from patchnetvlad.models.models_generic import get_backend, get_model, get_pca_encoding
+from torch.nn.parallel import DistributedDataParallel
 def set_random_seed(seed):
     if seed >= 0:
         print("Set random seed@@@@@@@@@@@@@@@@@@@@")
@@ -38,6 +40,7 @@ def set_random_seed(seed):
 class Trainer:
     def __init__(self, options):
         now = datetime.now()
+        torch.distributed.init_process_group(backend='gloo',init_method='env://')
         current_time_date = now.strftime("%d%m%Y-%H:%M:%S")
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
@@ -47,7 +50,7 @@ class Trainer:
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
         #######################
         if not self.opt.debug:
-            wandb.init(project="Access", entity="bigchan")
+            wandb.init(project="Ele_Ablation_1", entity="bigchan")
             wandb.run.name =self.opt.model_name
         #######################
         #######################
@@ -119,19 +122,26 @@ class Trainer:
         elif self.opt.model=="transdssl":
             self.models["encoder"] =TRANSDSSLEncoder(backbone="S",infer=False)
             self.models["depth"] = TRANSDSSLDecoder(backbone="S",infer=False)
-            
-        self.models["encoder"].to(self.device)
+        
+        self.models["encoder"].cuda()
         self.parameters_to_train += list(self.models["encoder"].parameters())
         if self.opt.distill:
-            self.models["encoder_t"].to(self.device)
+            
+            
+            self.models["encoder_t"].cuda()
+            self.models["encoder_t"] =DistributedDataParallel(self.models["encoder_t"])
             self.parameters_to_train += list(self.models["encoder_t"].parameters())
-        
-        self.models["depth"].to(self.device)
+            
+        self.models["depth"].cuda()
         self.parameters_to_train += list(self.models["depth"].parameters())
         if self.opt.distill:
-            self.models["depth_t"].to(self.device)
+            self.models["depth_t"].cuda()
+            self.models["depth_t"] =DistributedDataParallel(self.models["depth_t"] )
             self.parameters_to_train += list(self.models["depth_t"].parameters())
             
+            
+        self.models["encoder"] =DistributedDataParallel(self.models["encoder"] )
+        self.models["depth"] =DistributedDataParallel(self.models["depth"] )
         para_sum = sum(p.numel() for p in self.models['depth'].parameters())
         
         print('params in depth decoder',para_sum)
@@ -140,10 +150,10 @@ class Trainer:
             self.model_D=[]
             self.model_optimizer_D=[]
             for i in range(len(self.opt.scales)):
-                self.model_D.append(FCDiscriminator(1).to(self.device))
-                self.model_optimizer_D.append(optim.Adam(list(self.model_D[i].parameters()),1e-4))#learning_rate=1e-4
+                self.model_D.append(FCDiscriminator(1).cuda())
+                self.model_optimizer_D.append(optim.AdamW(list(self.model_D[i].parameters()),1e-4))#learning_rate=1e-4
             self.bce_loss = torch.nn.BCEWithLogitsLoss()
-        if self.opt.transloss:
+        if self.opt.transloss or self.opt.transloss_d:
             
             config = get_config("configs/hrt/hrt_tiny.yaml")
             self.trans_model=HighResolutionTransformer(config["MODEL"]["HRT"]).cuda()
@@ -152,20 +162,22 @@ class Trainer:
             for param in self.trans_model.parameters():
                 param.requires_grad = False
             self.trans_model.eval()
-        if self.opt.vggloss:
-            self.vggmodel=torchvision.models.vgg19(pretrained=True).features.cuda()
+        if self.opt.vggloss or self.opt.vggloss_d:
+            self.vggmodel=torchvision.models.vgg19(pretrained=True).features
+            self.vggmodel=torch.nn.DataParallel(self.vggmodel ).cuda()
             for param in self.vggmodel.parameters():
                 param.requires_grad = False
             self.vggmodel.eval()
-        if self.opt.patchvlad:
-            self.patchmodel=load_patchNet().cuda()
+        if self.opt.patchvlad or self.opt.patchvlad_d:
+            self.patchmodel=load_patchNet()
+            self.patchmodel=torch.nn.DataParallel(self.patchmodel ).cuda()
             self.patchmodel.eval()
         ####################################################
         
-        self.model_optimizer = optim.Adam(self.parameters_to_train, 0.5 * self.opt.learning_rate)#learning_rate=1e-4
+        self.model_optimizer = optim.AdamW(self.parameters_to_train, 0.5 * self.opt.learning_rate) #learning_rate=1e-4
         
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, self.opt.scheduler_step_size, 0.1)#defualt = 15'step size of the scheduler'
+            self.model_optimizer, self.opt.scheduler_step_size, 0.1) #defualt = 15'step size of the scheduler'
         
         if self.opt.load_weights_folder is not None and self.opt.model !="GBNet":
             self.load_model()
@@ -202,7 +214,7 @@ class Trainer:
 
         if not self.opt.no_ssim:
             self.ssim = SSIM()
-            self.ssim.to(self.device)
+            self.ssim.cuda()
         self.num_batch_k = train_dataset.__len__() // self.opt.batch_size
 
         self.backproject_depth = {}
@@ -212,10 +224,10 @@ class Trainer:
             w = self.opt.width // (2 ** scale)
 
             self.backproject_depth[scale] = BackprojectDepth(self.opt.batch_size, h, w)#in layers.py
-            self.backproject_depth[scale].to(self.device)
+            self.backproject_depth[scale].cuda()
 
             self.project_3d[scale] = Project3D(self.opt.batch_size, h, w)
-            self.project_3d[scale].to(self.device)
+            self.project_3d[scale].cuda()
 
         self.depth_metric_names = [
             "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
@@ -300,7 +312,7 @@ class Trainer:
                 for i in self.opt.scales:
                     D_t_0 = self.model_D[i](F.softmax(outputs_t[('disp', i)]))
                     D_t_0_loss = \
-                    self.bce_loss(D_t_0,Variable(torch.FloatTensor(D_t_0.data.size()).fill_(source_label)).to(self.device))
+                    self.bce_loss(D_t_0,Variable(torch.FloatTensor(D_t_0.data.size()).fill_(source_label)).cuda())
                     losses["loss/D_t_0_{}".format(i)] = D_t_0_loss
                     total_loss+=D_t_0_loss
             ####################################################
@@ -315,12 +327,12 @@ class Trainer:
                 for i in self.opt.scales:
                     ### RGB_0
                     D_R_0 = self.model_D[i](F.softmax(outputs[('disp', i)].detach()))
-                    loss_rgb_0 =self.bce_loss(D_R_0,Variable(torch.FloatTensor(D_R_0.data.size()).fill_(source_label)).to(self.device))
+                    loss_rgb_0 =self.bce_loss(D_R_0,Variable(torch.FloatTensor(D_R_0.data.size()).fill_(source_label)).cuda())
                     losses["loss/D_R_0_{}".format(i)] = loss_rgb_0
                     loss_rgb_0.backward()
                     ### thermal_1
                     D_t_1 = self.model_D[i](F.softmax(outputs_t[('disp', i)].detach()))
-                    loss_thermal_1 =self.bce_loss(D_t_1,Variable(torch.FloatTensor(D_t_1.data.size()).fill_(target_label)).to(self.device))
+                    loss_thermal_1 =self.bce_loss(D_t_1,Variable(torch.FloatTensor(D_t_1.data.size()).fill_(target_label)).cuda())
                     losses["loss/D_t_1_{}".format(i)] = loss_thermal_1
                     loss_thermal_1.backward()
             ####################################################
@@ -333,7 +345,7 @@ class Trainer:
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000#log_fre 's defualt = 250
+            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000 #log_fre 's defualt = 250
             late_phase = self.step % 1000 == 0
             
             if early_phase or late_phase:
@@ -354,7 +366,7 @@ class Trainer:
         """
         
         for key, ipt in inputs.items():#inputs.values() has :12x3x196x640.
-            inputs[key] = ipt.to(self.device)#put tensor in gpu memory
+            inputs[key] = ipt.cuda()#put tensor in gpu memory
 
         if self.opt.pose_model_type == "shared":
             # If we are using a shared encoder for both depth and pose (as advocated
@@ -568,8 +580,8 @@ class Trainer:
         return loss_trans/len_
     def foward_vlad(self,input_data):
         pool_size=4096
-        image_encoding = self.patchmodel.encoder(input_data)
-        vlad_local, vlad_global = self.patchmodel.pool(image_encoding)
+        image_encoding = self.patchmodel.module.encoder(input_data)
+        vlad_local, vlad_global = self.patchmodel.module.pool(image_encoding)
         vlad_global_pca = get_pca_encoding(self.patchmodel, vlad_global)
         vlad_local_pca=[]
         for this_iter, this_local in enumerate(vlad_local):
@@ -612,7 +624,11 @@ class Trainer:
         
         Dg = torch.var(g) + 0.15 * torch.pow(torch.mean(g), 2)
         return 10 * torch.sqrt(Dg)
-    
+
+    def silogloss(self, pred, target):
+        variance_focus=0.85
+        d = torch.log(pred) - torch.log(target)
+        return torch.sqrt((d ** 2).mean() - variance_focus * (d.mean() ** 2)) * 10.0
     def compute_losses(self, inputs, outputs, outputs_t):
         """Compute the reprojection and smoothness losses for a minibatch
         """
@@ -720,24 +736,26 @@ class Trainer:
                     disp=F.interpolate(
                         disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)            
                     disp_t=F.interpolate( disp_t, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
-                    loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*automask  
+                    if self.opt.SSIM_d:
+                        loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*automask  
 
-                    loss += loss_tcdistill.mean()#*10
-                    loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*automask  
+                        loss += loss_tcdistill.mean()#*10
                     
-                    loss += loss_tcdistill.mean()#*10
-#                     if self.opt.SIlogloss:
-#                         loss_SIlogs=self.compute_distill_loss(disp_t, disp.detach())*0.01
-#                         loss += loss_SIlogs
+                    if self.opt.patchvlad_d:
+                        loss_patch=self.compute_patch_loss(disp_t, disp.detach())*10
+#                         import pdb;pdb.set_trace()
+                        loss +=loss_patch
+                    if self.opt.SIlogloss:
+                        loss_SIlogs=self.silogloss(disp_t, disp.detach())*0.01
+                        loss += loss_SIlogs
                         
-#                     if self.opt.transloss:
-#                         loss_trans=self.compute_trans_loss(disp_t, disp.detach())*0.1
-#                         loss +=loss_trans
+                    if self.opt.transloss_d:
+                        loss_trans=self.compute_trans_loss(disp_t, disp.detach())*0.1
+                        loss +=loss_trans
 
-#                     if self.opt.vggloss:
-#                         loss_vgg=self.compute_vgg_loss(disp_t, disp.detach())
-
-#                         loss +=loss_vggs
+                    if self.opt.vggloss_d:
+                        loss_vgg=self.compute_vgg_loss(disp_t, disp.detach())
+                        loss +=loss_vgg
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
         

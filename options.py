@@ -19,7 +19,7 @@ class MonodepthOptions:
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
-                                 default=os.path.join(os.path.expanduser("~"), "tmp_hpc"))
+                                 default=os.path.join("checkpoint"))
 
         # TRAINING options
         self.parser.add_argument("--model_name",
@@ -231,7 +231,15 @@ class MonodepthOptions:
         self.parser.add_argument("--transloss",
                                  help="transloss",
                                  action="store_true")
+        self.parser.add_argument("--transloss_d",
+                                 help="transloss",
+                                 action="store_true")
         self.parser.add_argument("--vggloss",
+                                 help="vggloss",
+                                 action="store_true")
+        self.parser.add_argument("--local_rank",
+                                 help="vggloss",)
+        self.parser.add_argument("--vggloss_d",
                                  help="vggloss",
                                  action="store_true")
         self.parser.add_argument("--SIlogloss",
@@ -240,7 +248,13 @@ class MonodepthOptions:
         self.parser.add_argument("--patchvlad",
                                  help="patchvlad",
                                  action="store_true")   
-        
+        self.parser.add_argument("--patchvlad_d",
+                                 help="patchvlad",
+                                 action="store_true") 
+        self.parser.add_argument("--SSIM_d",
+                                 help="patchvlad",
+                                 action="store_true")   
+                                 
         
     def parse(self):
         self.options = self.parser.parse_args()
