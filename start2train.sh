@@ -7,6 +7,7 @@
 #                 --data_path MTN_data --log_dir ./tmp --using_attention --using_diff --model DIFF \
 #                 --load_weights_folder diffnet_640x192_ms #--debug #--num_workers 0
 
+
 # Thermal
 # OMP_NUM_THREADS=3 CUDA_VISIBLE_DEVICES=2 python train.py --height 448 --width 512 --scheduler_step_size 14 --dataset kaist --split kaist --num_epochs 50 --max_depth 50 \
 #                 --batch_size 4 --frame_ids 0 --use_stereo --model_name Kaist_diff_Thermal --scale_depth\
@@ -29,3 +30,4 @@ OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m torch.distributed.laun
                 --batch_size 1 --frame_ids 0 --use_stereo --model_name Kaist_diff_distill_Only_vggloss_d_patchvlad_d_v --scale_depth\
                 --data_path MTN_data --log_dir ./tmp --using_attention --using_diff --model DIFF --thermal --debug \
                 --load_weights_folder diffnet_640x192_ms --distill --compute --SSIM_d --vggloss_d --patchvlad_d --vggloss --patchvlad\
+

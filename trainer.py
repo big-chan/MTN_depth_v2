@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division, print_function
+
 from datetime import datetime
 import numpy as np
 import math
@@ -119,6 +120,18 @@ class Trainer:
         elif self.opt.model=="GBNet":
             self.models["encoder"] =networks.test_hr_encoder.hrnet18(True)
             self.models["depth"] = networks.GBNet(self.opt)
+            if self.opt.distill:
+                self.models["encoder_t"] = networks.test_hr_encoder.hrnet18(True)
+                self.models["encoder_t"].num_ch_enc = [ 64, 18, 36, 72, 144 ]
+                self.models["depth_t"] =  networks.GBNet(self.opt)
+        elif self.opt.model=="GBNet_v2":
+            self.models["encoder"] =networks.GBNetEncoder(self.opt)
+            self.models["depth"] = networks.GBNet_v2(self.opt)
+            if self.opt.distill:
+                self.models["encoder_t"] = networks.GBNetEncoder(self.opt)
+                self.models["encoder_t"].num_ch_enc = [ 64, 18, 36, 72, 144 ]
+                self.models["depth_t"] = self.models["depth"] # networks.GBNet(self.opt)
+            
         elif self.opt.model=="transdssl":
             self.models["encoder"] =TRANSDSSLEncoder(backbone="S",infer=False)
             self.models["depth"] = TRANSDSSLDecoder(backbone="S",infer=False)
@@ -173,13 +186,14 @@ class Trainer:
             self.patchmodel=torch.nn.DataParallel(self.patchmodel ).cuda()
             self.patchmodel.eval()
         ####################################################
-        
+
         self.model_optimizer = optim.AdamW(self.parameters_to_train, 0.5 * self.opt.learning_rate) #learning_rate=1e-4
+
         
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1) #defualt = 15'step size of the scheduler'
         
-        if self.opt.load_weights_folder is not None and self.opt.model !="GBNet":
+        if self.opt.load_weights_folder is not None and self.opt.model !="GBNet_v2" :
             self.load_model()
 
         print("Training model named:\n  ", self.opt.model_name)
@@ -383,10 +397,12 @@ class Trainer:
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
             if self.opt.distill:
-                features_color = self.models["encoder"](inputs["color_aug", 0, 0])
-                features_thermal = self.models["encoder_t"](inputs["thermal", 0, 0])
-                outputs_c = self.models["depth"](features_color)
-                outputs_t = self.models["depth_t"](features_thermal)
+                self.features_color = self.models["encoder"](inputs["color_aug", 0, 0])
+                self.features_thermal = self.models["encoder_t"](inputs["thermal", 0, 0])
+                # import pdb;pdb.set_trace()
+                outputs_c = self.models["depth"](self.features_color)
+                outputs_t = self.models["depth_t"](self.features_thermal)
+                # import pdb;pdb.set_trace()
             else:
                 if self.opt.thermal:
                     features = self.models["encoder"](inputs["thermal", 0, 0])
@@ -650,7 +666,10 @@ class Trainer:
             
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
-
+            if self.opt.model=="GBNet_v2":
+                disp_feature = self.features_color[("disp", scale)]
+                disp_t_feature = self.features_thermal[("disp", scale)]
+            
             for frame_id in self.opt.frame_ids[1:]:
                 pred = outputs[("color", frame_id, scale)]
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
@@ -680,20 +699,6 @@ class Trainer:
                 else:
                     # save both images, and do min all at once below
                     identity_reprojection_loss = identity_reprojection_losses
-
-#             elif self.opt.predictive_mask:
-#                 mask = outputs["predictive_mask"]["disp", scale]
-#                 if not self.opt.v1_multiscale:
-#                     mask = F.interpolate(
-#                         mask, [self.opt.height, self.opt.width],
-#                         mode="bilinear", align_corners=False)
-
-#                 reprojection_losses *= mask
-#                 #reprojection_losses.size() =12X2X192X640 
-
-#                 # add a loss pushing mask to 1 (using nn.BCELoss for stability)
-#                 weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda()) if torch.cuda.is_available() else   0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cpu())
-#                 loss += weighting_loss.mean()
 
             if self.opt.avg_reprojection:
                 reprojection_loss = reprojection_losses.mean(1, keepdim=True)
@@ -733,11 +738,11 @@ class Trainer:
 
             if self.opt.distill and self.opt.compute:
 #                 try:
-                    disp=F.interpolate(
-                        disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)            
+                    disp=F.interpolate(disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)            
                     disp_t=F.interpolate( disp_t, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
                     if self.opt.SSIM_d:
                         loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*automask  
+
 
                         loss += loss_tcdistill.mean()#*10
                     
@@ -748,6 +753,7 @@ class Trainer:
                     if self.opt.SIlogloss:
                         loss_SIlogs=self.silogloss(disp_t, disp.detach())*0.01
                         loss += loss_SIlogs
+
                         
                     if self.opt.transloss_d:
                         loss_trans=self.compute_trans_loss(disp_t, disp.detach())*0.1
@@ -850,7 +856,8 @@ class Trainer:
 
         with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
             json.dump(to_save, f, indent=2)
-
+    def tensor2cv(self,img):
+        disp=pred_disp[0].cpu().detach().numpy().transpose((1,2,0))
     def save_model(self):
         """Save model weights to disk
         """
