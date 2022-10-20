@@ -18,7 +18,7 @@ def load_patchNet():
     config = configparser.ConfigParser()
     config.read(join(PATCHNETVLAD_ROOT_DIR, 'configs/performance.ini'))
     encoder_dim, encoder = get_backend()
-    resume_ckpt='/home/dchan/workspace/Access/Depth/Patch-NetVLAD/patchnetvlad/./pretrained_models/mapillary_WPCA4096.pth.tar'
+    resume_ckpt='./pretrained_models/mapillary_WPCA4096.pth.tar'
     checkpoint = torch.load(resume_ckpt, map_location=lambda storage, loc: storage)
     config['global_params']['num_clusters'] = str(checkpoint['state_dict']['pool.centroids'].shape[0])
     pool_size = int(config['global_params']['num_pcs'])

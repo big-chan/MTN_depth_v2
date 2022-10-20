@@ -41,7 +41,9 @@ def set_random_seed(seed):
 class Trainer:
     def __init__(self, options):
         now = datetime.now()
-        torch.distributed.init_process_group(backend='gloo',init_method='env://')
+        #
+#         torch.distributed.init_process_group(backend='gloo',init_method='env://')
+        #
         current_time_date = now.strftime("%d%m%Y-%H:%M:%S")
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
@@ -135,26 +137,63 @@ class Trainer:
         elif self.opt.model=="transdssl":
             self.models["encoder"] =TRANSDSSLEncoder(backbone="S",infer=False)
             self.models["depth"] = TRANSDSSLDecoder(backbone="S",infer=False)
-        
+            ##############  
+            encoder_st=self.models["encoder"].state_dict()
+            encoder_st_key=list(encoder_st.keys())
+            decoder_st=self.models["depth"].state_dict()
+            decoder_st_key=list(decoder_st.keys())
+            pre=torch.load("KITTI.ckpt")
+            pre_keys=list(pre["state_dict"].keys())
+            for k in pre_keys:
+                nk=k[:15]
+                if nk=="model.depth_net":
+                    if k[16:] in encoder_st_key:
+                        encoder_st[k[16:]]=pre["state_dict"][k]
+                        
+                    if k[16:] in decoder_st_key:
+                        decoder_st[k[16:]]=pre["state_dict"][k]
+            self.models["encoder"].load_state_dict(encoder_st)
+            self.models["depth"].load_state_dict(decoder_st)
+            
+            if self.opt.distill:
+                self.models["encoder_t"] = TRANSDSSLEncoder(backbone="S",infer=False)
+                self.models["depth_t"] = TRANSDSSLDecoder(backbone="S",infer=False)
+                encoder_st=self.models["encoder_t"].state_dict()
+                encoder_st_key=list(encoder_st.keys())
+                decoder_st=self.models["depth_t"].state_dict()
+                decoder_st_key=list(decoder_st.keys())
+                pre=torch.load("KITTI.ckpt")
+                pre_keys=list(pre["state_dict"].keys())
+                for k in pre_keys:
+                    nk=k[:15]
+                    if nk=="model.depth_net":
+                        if k[16:] in encoder_st_key:
+                            encoder_st[k[16:]]=pre["state_dict"][k]
+                            
+                        if k[16:] in decoder_st_key:
+                            decoder_st[k[16:]]=pre["state_dict"][k]
+                self.models["encoder_t"].load_state_dict(encoder_st)
+                self.models["depth_t"].load_state_dict(decoder_st)
+            ##############
         self.models["encoder"].cuda()
         self.parameters_to_train += list(self.models["encoder"].parameters())
         if self.opt.distill:
             
             
             self.models["encoder_t"].cuda()
-            self.models["encoder_t"] =DistributedDataParallel(self.models["encoder_t"])
+#             self.models["encoder_t"] =DistributedDataParallel(self.models["encoder_t"])
             self.parameters_to_train += list(self.models["encoder_t"].parameters())
             
         self.models["depth"].cuda()
         self.parameters_to_train += list(self.models["depth"].parameters())
         if self.opt.distill:
             self.models["depth_t"].cuda()
-            self.models["depth_t"] =DistributedDataParallel(self.models["depth_t"] )
+#             self.models["depth_t"] =DistributedDataParallel(self.models["depth_t"] )
             self.parameters_to_train += list(self.models["depth_t"].parameters())
             
             
-        self.models["encoder"] =DistributedDataParallel(self.models["encoder"] )
-        self.models["depth"] =DistributedDataParallel(self.models["depth"] )
+#         self.models["encoder"] =DistributedDataParallel(self.models["encoder"] )
+#         self.models["depth"] =DistributedDataParallel(self.models["depth"] )
         para_sum = sum(p.numel() for p in self.models['depth'].parameters())
         
         print('params in depth decoder',para_sum)
@@ -182,8 +221,9 @@ class Trainer:
                 param.requires_grad = False
             self.vggmodel.eval()
         if self.opt.patchvlad or self.opt.patchvlad_d:
-            self.patchmodel=load_patchNet()
-            self.patchmodel=torch.nn.DataParallel(self.patchmodel ).cuda()
+            self.patchmodel=load_patchNet().cuda()
+            # import pdb;pdb.set_trace()
+            # self.patchmodel=torch.nn.DataParallel(self.patchmodel ).cuda()
             self.patchmodel.eval()
         ####################################################
 
@@ -596,8 +636,8 @@ class Trainer:
         return loss_trans/len_
     def foward_vlad(self,input_data):
         pool_size=4096
-        image_encoding = self.patchmodel.module.encoder(input_data)
-        vlad_local, vlad_global = self.patchmodel.module.pool(image_encoding)
+        image_encoding = self.patchmodel.encoder(input_data)
+        vlad_local, vlad_global = self.patchmodel.pool(image_encoding)
         vlad_global_pca = get_pca_encoding(self.patchmodel, vlad_global)
         vlad_local_pca=[]
         for this_iter, this_local in enumerate(vlad_local):
@@ -645,12 +685,33 @@ class Trainer:
         variance_focus=0.85
         d = torch.log(pred) - torch.log(target)
         return torch.sqrt((d ** 2).mean() - variance_focus * (d.mean() ** 2)) * 10.0
+    
+    def compute_selfdistill_losses(self, inputs, outputs, outputs_t):
+        losses = {}
+        total_loss = 0
+        
+        gt_disp=outputs[('disp', 0)].detach()
+        target_res = gt_disp.shape[-2:]
+        selfdistillation_loss=0
+        for scale in range(1,4):
+            
+            down2up_disp = F.interpolate(outputs[("disp", scale)], target_res, mode="bilinear", align_corners=None)
+            automask = F.interpolate(self.automask, target_res, mode="bilinear", align_corners=None)
+            # 
+            disp_diff = down2up_disp - gt_disp
+            try:
+                selfdistillation_loss += (torch.abs(disp_diff) * automask).mean() / 3
+            except:
+                import pdb;pdb.set_trace()
+        return selfdistillation_loss
+        # import pdb;pdb.set_trace()            
+            
     def compute_losses(self, inputs, outputs, outputs_t):
         """Compute the reprojection and smoothness losses for a minibatch
         """
         losses = {}
         total_loss = 0
-
+        
         for scale in self.opt.scales:
             #scales=[0,1,2,3]
             loss = 0
@@ -727,8 +788,8 @@ class Trainer:
                 
                 #outputs["identity_selection/{}".format(scale)] = (
                 outputs["identity_selection/{}".format(scale)] = (idxs > identity_reprojection_loss.shape[1] - 1).float()
-                automask=(idxs > identity_reprojection_loss.shape[1] - 1).float().unsqueeze(1)
-                
+                self.automask=(idxs > identity_reprojection_loss.shape[1] - 1).float().unsqueeze(1)
+                # import pdb;pdb.set_trace()
             loss += to_optimise.mean()
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
@@ -741,9 +802,7 @@ class Trainer:
                     disp=F.interpolate(disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)            
                     disp_t=F.interpolate( disp_t, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
                     if self.opt.SSIM_d:
-                        loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*automask  
-
-
+                        loss_tcdistill=self.compute_reprojection_loss(disp_t, disp.detach())*self.automask  
                         loss += loss_tcdistill.mean()#*10
                     
                     if self.opt.patchvlad_d:
@@ -766,7 +825,11 @@ class Trainer:
             losses["loss/{}".format(scale)] = loss
         
         total_loss /= self.num_scales
-        losses["loss"] = total_loss 
+        loss_distill=0
+        # loss_distill=self.compute_selfdistill_losses(inputs, outputs, outputs_t)
+        if self.epoch<10:
+            loss_distill*=self.epoch
+        losses["loss"] = total_loss+loss_distill #*(loss_distill) 
         return losses
 
     def compute_depth_losses(self, inputs, outputs, losses):
